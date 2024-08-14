@@ -9,6 +9,8 @@
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "esp_log.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
 
 // difinando o valor das entradas pela configuração do menu
 #define GPIO_INPUT_IO_0     CONFIG_GPIO_INPUT_0
@@ -25,46 +27,37 @@
 
 #define ESP_INTR_FLAG_DEFAULT 0
 
-// Inicializando uma 'Queue'
-static QueueHandle_t gpio_evt_queue = NULL;
-
-// Instanciando estrutura para elementos da 'Queue'
+// Definindo estrutura para elementos da 'Queue'
 typedef struct {
     uint64_t event_count;
     uint64_t alarm_value;
 } Alarm_element_t;
-// Instanciando estrutura Relogio
+// Definindo estrutura Relogio
 typedef struct {
     uint64_t hora;
     uint8_t mim;
     uint8_t seg;
 } Relogio;
 
-// iniciando TAGs para LOGs
-static const char* TAG = "Projeto exemplo"; 
-static const char* TIMER = "Timer"; 
-
+// Iniciando TAGs para LOGs
+static const char* TAG = "Projeto exemplo";
+static const char* TIMER = "Timer";
 // Iniciando estrutura goblal relogio
 static Relogio relogio = {};
+// Inicializando uma 'Queue' global
+static QueueHandle_t gpio_evt_queue = NULL;
+// Iniciando semaforo global
+static SemaphoreHandle_t semaphore_pwm = NULL;
+// Indica mode automatico do PWM
+static bool auto_mode = false;
 
-// Instanciando a leitura de interrupção
+// Definindo a função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_handler(void* arg){
     // retransformando o argumento passado a função pro tipo correto ('uint32_t')
     uint32_t gpio_num = (uint32_t) arg;
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
-// Instanciando a Tasks para checar as interupções
-static void gpio_task_isrcheck(void* arg){
-    
-    uint32_t io_num;
-    for (;;) {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            ESP_LOGI(TAG,"GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level(io_num));
-            gpio_set_level(GPIO_OUTPUT_IO_2, io_num-21);
-        }   
-    }
-}
-// Instanciando função de evento do timer
+// Definindo função de evento do timer
 static bool IRAM_ATTR Alarme_1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data){
     
     BaseType_t high_task_awoken = pdFALSE;
@@ -88,8 +81,29 @@ static bool IRAM_ATTR Alarme_1(gptimer_handle_t timer, const gptimer_alarm_event
     // return whether we need to yield at the end of ISR
     return(high_task_awoken == pdTRUE);
 }
-// Instanciando task do timer
+// definição da função de configurar GPIO
+static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, gpio_pulldown_t pull_down, gpio_int_type_t itr_type){
+    // inicializando a estrutura de configuração
+    gpio_config_t io_conf = {};
+
+    // mapeamento binario dos pinos
+    io_conf.pin_bit_mask = mask;
+    // setando o modo dos pinos saida ou entrada
+    io_conf.mode = mode;
+    // configura o modo de pull-up
+    io_conf.pull_up_en = pull_up;
+    // configura o modo pull-down
+    io_conf.pull_down_en = pull_down;
+    //desativa interrupção
+    io_conf.intr_type = itr_type;
+    
+    // configura as gpio com os valores setados
+    gpio_config(&io_conf);
+}
+
+// Definindo task do timer
 static void IRAM_ATTR timer_task(void *agr){
+    ESP_LOGE(TAG, "Task timer iniciou");
     // criado uma 'Queue' para Alarmes
     QueueHandle_t Alarms = xQueueCreate(10, sizeof(Alarm_element_t));
     // check para criação da 'Queue'
@@ -98,7 +112,7 @@ static void IRAM_ATTR timer_task(void *agr){
         return;
     }
 
-    // instanciando o timer
+    // Definindo o timer
     gptimer_handle_t gptimer = NULL;
     // Inciando estrutura de configuração do timer
     gptimer_config_t timer_config = {
@@ -126,45 +140,122 @@ static void IRAM_ATTR timer_task(void *agr){
     ESP_ERROR_CHECK(gptimer_start(gptimer));
 
     Alarm_element_t ele = {};
+    // loop da task
     while (1){
-        xQueueReceive(Alarms, &ele, pdMS_TO_TICKS(500));
+        // Espera semaforo ser liberado pela task PWM
+        // le a queue de alarmes e salva em uma variavel
+        if(xQueueReceive(Alarms, &ele, pdMS_TO_TICKS(500))){
+            ESP_LOGI(TIMER,"Contagem do timer:%"PRIu64", Valor do alarme:%"PRIu64"",ele.event_count,ele.alarm_value);
+        }
         ESP_LOGI(TIMER,"Relogio - %"PRIu64":%i:%i -", relogio.hora,relogio.mim,relogio.seg);
-        ESP_LOGI(TIMER,"Contagem do timer:%"PRIu64", Valor do alarme:%"PRIu64"",ele.event_count,ele.alarm_value);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
+        if (auto_mode){
+            // Libera o semaforo usado para sincronisar o LEDC PWM com o timer
+            xSemaphoreGive(semaphore_pwm);
+        }
+    }
+    
+}
+// Definindo task para checar as interupções
+static void gpio_task_isrcheck(void* arg){
+    ESP_LOGE(TAG, "Task isrcheck iniciou");
+    uint32_t io_num;
+    uint64_t LEDC_DUTY = 0;
+    // loop da task
+    for (;;) {
+        // checa se alguma interução foi adicionada a fila
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            // plota na tela qual a interrução encontrada
+            ESP_LOGI(TAG,"GPIO[%"PRIu32"] intr, val: %d\n", io_num, gpio_get_level(io_num));
+            //modo do PWM durante a interrupção
+            if (io_num == 21){
+                // ativa o modo manual
+                auto_mode = false;
+                // desliga o led IO2
+                gpio_set_level(GPIO_OUTPUT_IO_2, 0);
+
+                // incrementa o duty até o maximo e zera
+                if(LEDC_DUTY < 8192) {
+                LEDC_DUTY += 256;
+                ESP_LOGE(TAG, "Duty incrementado %"PRIu64"",LEDC_DUTY );
+                }
+                else {
+                LEDC_DUTY = 0;
+                ESP_LOGE(TAG, "Duty resetado %"PRIu64"",LEDC_DUTY );
+                }
+                // seta o duty incrementalmente
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+                // atualiza o valor do duty
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+                ESP_LOGE(TAG, "Duty atualizado %"PRIu64"",LEDC_DUTY );
+            }
+            else{
+                // ativa o modo automatico
+                auto_mode = true;
+                // liga o led IO2
+                gpio_set_level(GPIO_OUTPUT_IO_2, 1);
+            }
+        }   
+    }
+}
+// Definindo task do LEDC PWM
+static void IRAM_ATTR PWM_task(void* arg){
+    ESP_LOGE(TAG, "Task PWM iniciou");
+   // Configuração do timer do LEDC PWM
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_TIMER_13_BIT,
+        .freq_hz          = 5000,  // Set output frequency at 5 kHz
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Configuração do channel do LEDC PWM
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LEDC_LOW_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_0,
+        .timer_sel      = LEDC_TIMER_0,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = CONFIG_GPIO_OUTPUT_0,
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    
+    // tempo em 1 do PWM
+    uint64_t LEDC_DUTY = 0;
+    // loop da task
+    while (1){
+        // Espera semaforo ser liberado pela task timer e checa o modo do PWM
+        if (xSemaphoreTake(semaphore_pwm, portMAX_DELAY)){
+            // incrementa o duty até o maximo e resata
+            if(LEDC_DUTY <= 8192) {
+                LEDC_DUTY += 256;
+                ESP_LOGE(TAG, "Duty incrementado %"PRIu64"",LEDC_DUTY );
+            }
+            else {
+                LEDC_DUTY = 0;
+                ESP_LOGE(TAG, "Duty resetado %"PRIu64"",LEDC_DUTY );
+            }
+            // seta o duty incrementalmente
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+            // atualiza o valor do duty
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+            ESP_LOGE(TAG, "Duty atualizado %"PRIu64"",LEDC_DUTY );
+        }
     }
     
 }
 
 void app_main(void){
-    // inicando a task do timer
-    xTaskCreate(timer_task, "Inicia o timer", 2048, NULL, 10, NULL);
+    // criação do semaphore binario 
+    semaphore_pwm = xSemaphoreCreateBinary();
 
-    // inicializando a estrutura de configuração
-    gpio_config_t io_conf = {};
-
-    //disable interrupt
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    //set as output mode
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-    //disable pull-down mode
-    io_conf.pull_down_en = 0;
-    //disable pull-up mode
-    io_conf.pull_up_en = 0;
-    //configure GPIO with the given settings
-    gpio_config(&io_conf);
-
-    // interrupção na borda de descida
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
-    // mapeamento binario dos pinos
-    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
-    // setando pinos como entradas
-    io_conf.mode = GPIO_MODE_INPUT;
-    // ativa o resistor de pull-up
-    io_conf.pull_up_en = 1;
-    // configura as gpio com os valores setados
-    gpio_config(&io_conf);
+    // Configurando pinos de saida do esp32
+    config_gpio(GPIO_OUTPUT_PIN_SEL,GPIO_MODE_OUTPUT,0,0,GPIO_INTR_DISABLE);
+    // Configurando pinos de entrada do esp32
+    config_gpio(GPIO_INPUT_PIN_SEL,GPIO_MODE_INPUT,1,0,GPIO_INTR_POSEDGE);
 
     // criado uma 'Queue' para interrupções
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
@@ -173,23 +264,18 @@ void app_main(void){
         ESP_LOGE(TAG, "Falha ao criar Queue");
         return;
     }
+    
+    // inicando a task do timer
+    xTaskCreate(timer_task, "Inicia o timer", 2048, NULL, 10, NULL);
+    // inicando a task do PWM
+    xTaskCreate(PWM_task, "Inicia o PWM", 2048, NULL, 10, NULL);
     // inicando a task para leitura das interrupções
     xTaskCreate(gpio_task_isrcheck, "Pilha de interrupções", 2048, NULL, 10, NULL);
 
-    // instanciando o serviço de isr
+    // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     // conecta o interrupor à um pino gpio especifico
     gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler, (void*) GPIO_INPUT_IO_0);
     // conecta o interrupor à um pino gpio especifico
     gpio_isr_handler_add(GPIO_INPUT_IO_1, gpio_isr_handler, (void*) GPIO_INPUT_IO_1);
-
-    /*
-    int cnt = 0;
-    while (1){
-        //printf("cnt: %d\n", cnt++);
-        //gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
-        //gpio_set_level(GPIO_OUTPUT_IO_1, (cnt+1) % 2);
-        vTaskDelay(xDelay);
-    }
-    */
 }
