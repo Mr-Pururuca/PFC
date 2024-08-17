@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 // difinando o valor das entradas pela configuração do menu
 #define GPIO_INPUT_IO_0     CONFIG_GPIO_INPUT_0
@@ -38,23 +41,32 @@ typedef struct {
     uint8_t mim;
     uint8_t seg;
 } Relogio;
+// Definindo estrutura de leitura do ADC
+typedef struct{
+    int adc_raw[10];
+    int voltage[10];
+}ADC_data;
 
-// Iniciando TAGs para LOGs
+// Iniciando TAGs para LOGs no contexto global
 static const char* TAG = "Projeto exemplo";
 static const char* TIMER = "Timer";
-// Iniciando estrutura goblal relogio
+static const char* ADC = "ADC";
+// Iniciando estrutura relogio no contexto global 
 static Relogio relogio = {};
-// Inicializando uma 'Queue' global
+// Inicializando 'Queues' no contexto global
 static QueueHandle_t gpio_evt_queue = NULL;
-// Iniciando semaforo global
+static QueueHandle_t adc_read_queue = NULL;
+// Iniciando semaforos no contexto global
 static SemaphoreHandle_t semaphore_pwm = NULL;
-// Indica mode automatico do PWM
+static SemaphoreHandle_t semaphore_ADC = NULL;
+// Iniciando variavel binaria no contexto global. Indica o modo automatico do PWM
 static bool auto_mode = false;
 
 // Definindo a função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_handler(void* arg){
     // retransformando o argumento passado a função pro tipo correto ('uint32_t')
     uint32_t gpio_num = (uint32_t) arg;
+    // inserie o pino que ativou a interrupção na fila
     xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
 }
 // Definindo função de evento do timer
@@ -63,21 +75,28 @@ static bool IRAM_ATTR Alarme_1(gptimer_handle_t timer, const gptimer_alarm_event
     BaseType_t high_task_awoken = pdFALSE;
     // retransformando o argumento passado a função pro tipo correto ('Queue')
     QueueHandle_t queue = (QueueHandle_t)user_data;
-    // Retrieve count value and send to queue
+
+    // Recupera o valor da count e manda para queue.
     Alarm_element_t ele = {
         .event_count = edata->count_value,
         .alarm_value = edata->alarm_value,
     };
     xQueueSendFromISR(queue, &ele, &high_task_awoken);
+
     // reconfigurando o valor do alarme
     gptimer_alarm_config_t alarm_config = {
         .alarm_count = edata->alarm_value + 100000, // alarm in next 1s
     };
     gptimer_set_alarm_action(timer, &alarm_config);
+
     // atualizando horario do relogio.
     relogio.seg = (edata->count_value/1000000) % 60;
     relogio.mim = ((edata->count_value/1000000) / 60) % 60;
     relogio.hora = ((edata->count_value/1000000) / 3600);
+    
+    // libera o semafora para sincronizar a leitura do ADC
+    xSemaphoreGive(semaphore_ADC);
+
     // return whether we need to yield at the end of ISR
     return(high_task_awoken == pdTRUE);
 }
@@ -99,6 +118,43 @@ static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, 
     
     // configura as gpio com os valores setados
     gpio_config(&io_conf);
+}
+// definição da função de calibração do ADC
+static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle){
+    // Iniciando um calibrador ADC
+    adc_cali_handle_t handle = NULL;
+    // Inicando estrutura de codigos de erro do ESP
+    esp_err_t ret = ESP_FAIL;
+    // Iniciando estado da calibração
+    bool calibrated = false;
+    
+    ESP_LOGI(TAG, "Esquema de calibração utilizado é Line Fitting");
+    adc_cali_line_fitting_config_t cali_config = {
+        .unit_id = unit,
+        .atten = atten,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+    if (ret == ESP_OK) {
+        calibrated = true;
+    }
+    // aponta o calibrador passado como parametro para calibrador configurado na função.
+    *out_handle = handle;
+    // testa e plota o resoltado da calibração
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Calibration Success");
+    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
+        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
+    } else {
+        ESP_LOGE(TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+// definindo função de deletar a calibração do ADC
+static void adc_calibration_deinit(adc_cali_handle_t handle){
+    ESP_LOGI(TAG, "Deletando schema de calibração Line Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle)); 
 }
 
 // Definindo task do timer
@@ -140,15 +196,19 @@ static void IRAM_ATTR timer_task(void *agr){
     ESP_ERROR_CHECK(gptimer_start(gptimer));
 
     Alarm_element_t ele = {};
+    ADC_data adc_read = {};
     // loop da task
     while (1){
-        // Espera semaforo ser liberado pela task PWM
         // le a queue de alarmes e salva em uma variavel
         if(xQueueReceive(Alarms, &ele, pdMS_TO_TICKS(500))){
             ESP_LOGI(TIMER,"Contagem do timer:%"PRIu64", Valor do alarme:%"PRIu64"",ele.event_count,ele.alarm_value);
         }
         ESP_LOGI(TIMER,"Relogio - %"PRIu64":%i:%i -", relogio.hora,relogio.mim,relogio.seg);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        
+        if(xQueueReceive(adc_read_queue, &adc_read, pdMS_TO_TICKS(500))){
+            ESP_LOGI(ADC, "Valor lido no canal[%d] Raw Data: %d - Calibrado: %d mV", ADC_CHANNEL_3, adc_read.adc_raw[0],adc_read.voltage[0]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
         if (auto_mode){
             // Libera o semaforo usado para sincronisar o LEDC PWM com o timer
             xSemaphoreGive(semaphore_pwm);
@@ -217,7 +277,7 @@ static void IRAM_ATTR PWM_task(void* arg){
         .channel        = LEDC_CHANNEL_0,
         .timer_sel      = LEDC_TIMER_0,
         .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = CONFIG_GPIO_OUTPUT_0,
+        .gpio_num       = CONFIG_GPIO_OUTPUT_1,
         .duty           = 0, // Set duty to 0%
         .hpoint         = 0
     };
@@ -247,10 +307,52 @@ static void IRAM_ATTR PWM_task(void* arg){
     }
     
 }
+// Definindo task do ADC
+static void IRAM_ATTR ADC_task(void *arg){
+    ESP_LOGE(TAG, "Task ADC iniciou");
+    // iniciando um modulo ADC do modo oneshot
+    adc_oneshot_unit_handle_t adc_handle;
+    // configuração do modulo ADC
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
+    // configuração do canal do modulo ADC
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, &config));
+    // Calibração do modulo ADC
+    adc_cali_handle_t adc_cali_handle = NULL;
+    bool do_calibration = adc_calibration_init(ADC_UNIT_1, ADC_CHANNEL_3, ADC_ATTEN_DB_12, &adc_cali_handle);
+    
+    ADC_data adc_read = {};
+    // loop da task
+   while (1){ 
+        if (xSemaphoreTake(semaphore_ADC, portMAX_DELAY)){
+            // faz a leitura do chanal ADC
+            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &adc_read.adc_raw[0]));
+            // Checa se a calibração foi feita
+            if (do_calibration) {
+                // faz a conversão do valor bruto para a variavel
+                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle,  adc_read.adc_raw[0], &adc_read.voltage[0]));
+                }
+            // insere os valores brutos e convertidos na 'queue'
+            xQueueSendToFrontFromISR(adc_read_queue, &adc_read, NULL);
+        }
+    };
+    //Tear Down
+    ESP_ERROR_CHECK(adc_oneshot_del_unit(adc_handle));
+    if (do_calibration) {
+        adc_calibration_deinit(adc_cali_handle);
+    }
+}
 
 void app_main(void){
     // criação do semaphore binario 
     semaphore_pwm = xSemaphoreCreateBinary();
+    semaphore_ADC = xSemaphoreCreateBinary();
 
     // Configurando pinos de saida do esp32
     config_gpio(GPIO_OUTPUT_PIN_SEL,GPIO_MODE_OUTPUT,0,0,GPIO_INTR_DISABLE);
@@ -264,6 +366,13 @@ void app_main(void){
         ESP_LOGE(TAG, "Falha ao criar Queue");
         return;
     }
+    // criado uma 'Queue' para a leitura do ADC
+    adc_read_queue = xQueueCreate(10, sizeof(ADC_data));
+    // check para criação da 'Queue'
+    if (!adc_read_queue) {
+        ESP_LOGE(TAG, "Falha ao criar Queue");
+        return;
+    }
     
     // inicando a task do timer
     xTaskCreate(timer_task, "Inicia o timer", 2048, NULL, 10, NULL);
@@ -271,6 +380,8 @@ void app_main(void){
     xTaskCreate(PWM_task, "Inicia o PWM", 2048, NULL, 10, NULL);
     // inicando a task para leitura das interrupções
     xTaskCreate(gpio_task_isrcheck, "Pilha de interrupções", 2048, NULL, 10, NULL);
+    // inicnando a task do ADC
+    xTaskCreate(ADC_task,"Inciana o modulo ADC", 2048, NULL, 10, NULL);
 
     // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
