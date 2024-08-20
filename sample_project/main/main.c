@@ -1,3 +1,4 @@
+//---------------------------------------Bibliotecas----------------------------------------//
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,21 +16,22 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
-// difinando o valor das entradas pela configuração do menu
+//------------------------------------------Defines-----------------------------------------//
+// difinindo o valor das entradas pela configuração do menu
 #define GPIO_INPUT_IO_0     CONFIG_GPIO_INPUT_0
 #define GPIO_INPUT_IO_1     CONFIG_GPIO_INPUT_1
 // agrupar o mapeamento binario das portas de entrada
 #define GPIO_INPUT_PIN_SEL  ((1ULL<<GPIO_INPUT_IO_0) | (1ULL<<GPIO_INPUT_IO_1))
-
-// difinando o valor das saidas pela configuração do menu
+// difinindo o valor das saidas pela configuração do menu
 #define GPIO_OUTPUT_IO_0    CONFIG_GPIO_OUTPUT_0
 #define GPIO_OUTPUT_IO_1    CONFIG_GPIO_OUTPUT_1
 #define GPIO_OUTPUT_IO_2    CONFIG_GPIO_OUTPUT_2
 // agrupar o mapeamento binario das portas de saida
 #define GPIO_OUTPUT_PIN_SEL  (((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1)) | (1ULL<<GPIO_OUTPUT_IO_2))
-
+// definindo flag de interrupção
 #define ESP_INTR_FLAG_DEFAULT 0
 
+//-----------------------------------Estruturas de dados------------------------------------//
 // Definindo estrutura para elementos da 'Queue'
 typedef struct {
     uint64_t event_count;
@@ -47,59 +49,27 @@ typedef struct{
     int voltage[10];
 }ADC_data;
 
+//-------------------------------------------TAGs-------------------------------------------//
 // Iniciando TAGs para LOGs no contexto global
 static const char* TAG = "Projeto exemplo";
 static const char* TIMER = "Timer";
 static const char* ADC = "ADC";
-// Iniciando estrutura relogio no contexto global 
-static Relogio relogio = {};
+
+//-----------------------------------------Handles------------------------------------------//
 // Inicializando 'Queues' no contexto global
 static QueueHandle_t gpio_evt_queue = NULL;
 static QueueHandle_t adc_read_queue = NULL;
 // Iniciando semaforos no contexto global
 static SemaphoreHandle_t semaphore_pwm = NULL;
 static SemaphoreHandle_t semaphore_ADC = NULL;
+
+//------------------------------------Variaveis Globais-------------------------------------//
+// Iniciando estrutura relogio no contexto global 
+static Relogio relogio = {};
 // Iniciando variavel binaria no contexto global. Indica o modo automatico do PWM
 static bool auto_mode = false;
 
-// Definindo a função de leitura de interrupção
-static void IRAM_ATTR gpio_isr_handler(void* arg){
-    // retransformando o argumento passado a função pro tipo correto ('uint32_t')
-    uint32_t gpio_num = (uint32_t) arg;
-    // inserie o pino que ativou a interrupção na fila
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
-}
-// Definindo função de evento do timer
-static bool IRAM_ATTR Alarme_1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data){
-    
-    BaseType_t high_task_awoken = pdFALSE;
-    // retransformando o argumento passado a função pro tipo correto ('Queue')
-    QueueHandle_t queue = (QueueHandle_t)user_data;
-
-    // Recupera o valor da count e manda para queue.
-    Alarm_element_t ele = {
-        .event_count = edata->count_value,
-        .alarm_value = edata->alarm_value,
-    };
-    xQueueSendFromISR(queue, &ele, &high_task_awoken);
-
-    // reconfigurando o valor do alarme
-    gptimer_alarm_config_t alarm_config = {
-        .alarm_count = edata->alarm_value + 100000, // alarm in next 1s
-    };
-    gptimer_set_alarm_action(timer, &alarm_config);
-
-    // atualizando horario do relogio.
-    relogio.seg = (edata->count_value/1000000) % 60;
-    relogio.mim = ((edata->count_value/1000000) / 60) % 60;
-    relogio.hora = ((edata->count_value/1000000) / 3600);
-    
-    // libera o semafora para sincronizar a leitura do ADC
-    xSemaphoreGive(semaphore_ADC);
-
-    // return whether we need to yield at the end of ISR
-    return(high_task_awoken == pdTRUE);
-}
+//------------------------------------Funções genericas-------------------------------------//
 // definição da função de configurar GPIO
 static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, gpio_pulldown_t pull_down, gpio_int_type_t itr_type){
     // inicializando a estrutura de configuração
@@ -157,6 +127,47 @@ static void adc_calibration_deinit(adc_cali_handle_t handle){
     ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle)); 
 }
 
+//---------------------------------------Interrupções---------------------------------------//
+// Definindo a função de leitura de interrupção
+static void IRAM_ATTR gpio_isr_handler(void* arg){
+    // retransformando o argumento passado a função pro tipo correto ('uint32_t')
+    uint32_t gpio_num = (uint32_t) arg;
+    // inserie o pino que ativou a interrupção na fila
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+// Definindo função de evento do timer
+static bool IRAM_ATTR Alarme_1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data){
+    
+    BaseType_t high_task_awoken = pdFALSE;
+    // retransformando o argumento passado a função pro tipo correto ('Queue')
+    QueueHandle_t queue = (QueueHandle_t)user_data;
+
+    // Recupera o valor da count e manda para queue.
+    Alarm_element_t ele = {
+        .event_count = edata->count_value,
+        .alarm_value = edata->alarm_value,
+    };
+    xQueueSendFromISR(queue, &ele, &high_task_awoken);
+
+    // reconfigurando o valor do alarme
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = edata->alarm_value + 100000, // alarm in next 1s
+    };
+    gptimer_set_alarm_action(timer, &alarm_config);
+
+    // atualizando horario do relogio.
+    relogio.seg = (edata->count_value/1000000) % 60;
+    relogio.mim = ((edata->count_value/1000000) / 60) % 60;
+    relogio.hora = ((edata->count_value/1000000) / 3600);
+    
+    // libera o semafora para sincronizar a leitura do ADC
+    xSemaphoreGive(semaphore_ADC);
+
+    // return whether we need to yield at the end of ISR
+    return(high_task_awoken == pdTRUE);
+}
+
+//------------------------------------------Tasks-------------------------------------------//
 // Definindo task do timer
 static void IRAM_ATTR timer_task(void *agr){
     ESP_LOGE(TAG, "Task timer iniciou");
@@ -349,6 +360,7 @@ static void IRAM_ATTR ADC_task(void *arg){
     }
 }
 
+//--------------------------------------Função primaria-------------------------------------//
 void app_main(void){
     // criação do semaphore binario 
     semaphore_pwm = xSemaphoreCreateBinary();

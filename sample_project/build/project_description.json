@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "main",
-    "project_version":    "a6cb600-dirty",
+    "project_version":    "03de060-dirty",
     "project_path":       "D:/Documentos/UFMG/PFC/ESP32/Projetos/PFC/sample_project",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.2.2",
     "build_dir":          "D:/Documentos/UFMG/PFC/ESP32/Projetos/PFC/sample_project/build",
