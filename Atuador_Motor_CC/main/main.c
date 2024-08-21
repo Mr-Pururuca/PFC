@@ -31,9 +31,9 @@
 // definindo flag de interrupção
 #define ESP_INTR_FLAG_DEFAULT 0
 // definindo valor do de tensão de armadura maxima do motor
-#define V_A_MAX CONFIG_V_A_MAX
+#define V_A_MAX   25
 // definindo o algulo de atuação do motor
-#define GAMMA CONFIG_GOMMA
+#define GAMMA   15
 
 //-----------------------------------Estruturas de dados------------------------------------//
 // Definindo estrutura de leitura do ADC
@@ -44,8 +44,8 @@ typedef struct{
 
 //-------------------------------------------TAGs-------------------------------------------//
 static const char* TAG = "Projeto";
-static const char* PWM = "Atuador do Motor";
-static const char* ADC = "ADC";
+//static const char* PWM = "Atuador do Motor";
+//static const char* ADC = "ADC";
 
 //-----------------------------------------Drivers------------------------------------------//
 // Fazer drives de comunição para leitura do angulo
@@ -122,7 +122,7 @@ static void adc_calibration_deinit(adc_cali_handle_t handle){
 //------------------------------------------Tasks-------------------------------------------//
 // Definição da task para elitura do do ADC
 static void Leitura_ADC(void *arg){
-    ESP_LOGE(TAG, "Task ADC iniciou");
+    ESP_LOGI(TAG, "Task ADC iniciou");
     // iniciando um modulo ADC do modo oneshot
     adc_oneshot_unit_handle_t adc_handle;
     // configuração do modulo ADC
@@ -152,6 +152,7 @@ static void Leitura_ADC(void *arg){
         }
         // insere os valores brutos e convertidos na 'queue'
         xQueueSend(adc_read_queue, &adc_read, NULL);
+        //ESP_LOGI(ADC,"Valores lidos: %d", adc_read.voltage[0]);
         // libera semaforo pra sincornizar leitura com a atuação
         xSemaphoreGive(semaphore_pwm);
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -164,7 +165,7 @@ static void Leitura_ADC(void *arg){
 }
 // Definindo task para acionamento do motor via PWM
 static void PWM_task(void* arg){
-    ESP_LOGE(TAG, "Task PWM iniciou");
+    ESP_LOGI(TAG, "Task PWM iniciou");
    // Configuração do timer do LEDC PWM
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -196,15 +197,21 @@ static void PWM_task(void* arg){
         // Espera semaforo ser liberado pela task timer e checa o modo do PWM
         if (xSemaphoreTake(semaphore_pwm, portMAX_DELAY)){
             if(xQueueReceive(adc_read_queue, &adc_read, 0)){
-                if(adc_read.voltage < GAMMA){
-                    LEDC_DUTY = (V_a/V_A_MAX)*8191;
+                if((adc_read.voltage[0] < GAMMA*100) && Motor_on){
+                    LEDC_DUTY = (V_a*8191/V_A_MAX);
+                    // seta o duty do PWM
+                    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+                    // atualiza o valor do duty
+                    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+                    //ESP_LOGI(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
                 }
-                else LEDC_DUTY = 0;
-                // seta o duty do PWM
-                ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
-                // atualiza o valor do duty
-                ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
-                ESP_LOGE(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
+                else {
+                    LEDC_DUTY = 0;
+                    // seta o duty do PWM
+                    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+                    // atualiza o valor do duty
+                    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+                }
             }
         }
     }
@@ -214,12 +221,12 @@ static void PWM_task(void* arg){
 // Definindo da função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
     if(!Motor_on){
-        ESP_LOGI(TAG,"Excitação do sistema ligada");
+        //ESP_LOGI(TAG,"Excitação do sistema ligada");
         Motor_on = true;
         gpio_set_level(GPIO_OUTPUT_IO_2, 1);
     }
     else{
-        ESP_LOGI(TAG,"Excitação do sistema desligada");
+        //ESP_LOGI(TAG,"Excitação do sistema desligada");
         Motor_on = false;
         gpio_set_level(GPIO_OUTPUT_IO_2, 0);
     }
@@ -256,5 +263,5 @@ void app_main(void){
     // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     // Conecta o interrupor à um pino gpio especifico
-    gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler, (void*) GPIO_INPUT_IO_0);
+    gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_Motor_on, (void*) GPIO_INPUT_IO_0);
 }

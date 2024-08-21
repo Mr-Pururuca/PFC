@@ -1,4 +1,6 @@
-menu "Configuração de Parametros"
+menu "Parameters Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
 
     config GPIO_OUTPUT_0
         int "GPIO output pin 0"
@@ -34,18 +36,19 @@ menu "Configuração de Parametros"
         default 22
         help
             GPIO pin number to be used as GPIO_INPUT_IO_1.
-    
+
     config V_A_MAX
-        int "Tensão de armadura maxima do motor"
-        range 0 30
+        int "Tensão nominal de armadura do motor CC"
+        range 20 50
         default 25
         help
-            Valor da tensão aplicada na armadura do Motor de excitação do sistema.
+            Tensão nominal de armadura do motor cc de excitação do sistema
     
     config GAMMA
-        int "Valor do angulo de atuação do motor"
-        range 15 60
-        default 60 
+        int "Angulo de arbertura para excitação do sistema"
+        range "15" "60"
+        default 30
         help
-            Valor do angulo, em graus, de atuação do motor.
+            Posição angular do eixo da haste 1 que inicia a excitação sistema
+
 endmenu
