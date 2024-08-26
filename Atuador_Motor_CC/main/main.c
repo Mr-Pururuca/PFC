@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <sys/unistd.h>
+#include <sys/stat.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,6 +17,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_spiffs.h"
+#include "nvs_flash.h"
 
 //------------------------------------------Defines-----------------------------------------//
 // difinindo o valor das entradas pela configuração do menu
@@ -31,9 +35,9 @@
 // definindo flag de interrupção
 #define ESP_INTR_FLAG_DEFAULT 0
 // definindo valor do de tensão de armadura maxima do motor
-#define V_A_MAX   25
+#define V_A_MAX   CONFIG_V_A_MAX
 // definindo o algulo de atuação do motor
-#define GAMMA   15
+#define GAMMA   CONFIG_GAMMA
 
 //-----------------------------------Estruturas de dados------------------------------------//
 // Definindo estrutura de leitura do ADC
@@ -44,24 +48,26 @@ typedef struct{
 
 //-------------------------------------------TAGs-------------------------------------------//
 static const char* TAG = "Projeto";
-//static const char* PWM = "Atuador do Motor";
-//static const char* ADC = "ADC";
+static const char* PWM = "Atuador do Motor";
+static const char* ADC = "ADC";
+static const char* File = "File";
 
 //-----------------------------------------Drivers------------------------------------------//
-// Fazer drives de comunição para leitura do angulo
+// Fazer drives de comunição
 
 //-----------------------------------------Handles------------------------------------------//
 // Inicializando 'Queues' no contexto global
-static QueueHandle_t gpio_evt_queue = NULL;
+//static QueueHandle_t gpio_evt_queue = NULL;
 static QueueHandle_t adc_read_queue = NULL;
 // Iniciando semaforos no contexto global
 static SemaphoreHandle_t semaphore_pwm = NULL;
+static SemaphoreHandle_t semaphore_file = NULL;
 
 //------------------------------------Variaveis Globais-------------------------------------//
 // Variavel que liga a função de atuação do motor
 static bool Motor_on = false;
 
-//------------------------------------Funções genericas-------------------------------------//
+//--------------------------------------Funções Gerais--------------------------------------//
 // definição da função de configurar GPIO
 static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, gpio_pulldown_t pull_down, gpio_int_type_t itr_type){
     // inicializando a estrutura de configuração
@@ -118,9 +124,42 @@ static void adc_calibration_deinit(adc_cali_handle_t handle){
     ESP_LOGI(TAG, "Deletando schema de calibração Line Fitting");
     ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle)); 
 }
+// definição função para inicializar SPIFFS
+esp_err_t mount_storage(const char* base_path){
+    ESP_LOGI(TAG, "Initializing SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = base_path,
+        .partition_label = NULL,
+        .max_files = 5,   // This sets the maximum number of files that can be open at the same time
+        .format_if_mount_failed = true
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        } else if (ret == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+        return ret;
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(NULL, &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    return ESP_OK;
+}
 
 //------------------------------------------Tasks-------------------------------------------//
-// Definição da task para elitura do do ADC
+// Definição da task para leitura do do ADC
 static void Leitura_ADC(void *arg){
     ESP_LOGI(TAG, "Task ADC iniciou");
     // iniciando um modulo ADC do modo oneshot
@@ -149,13 +188,18 @@ static void Leitura_ADC(void *arg){
         if (do_calibration) {
             // faz a conversão do valor bruto para a variavel
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle,  adc_read.adc_raw[0], &adc_read.voltage[0]));
+            ESP_LOGI(ADC, "Valor lido de posição: %d",adc_read.voltage[0] );
         }
         // insere os valores brutos e convertidos na 'queue'
         xQueueSend(adc_read_queue, &adc_read, NULL);
-        //ESP_LOGI(ADC,"Valores lidos: %d", adc_read.voltage[0]);
         // libera semaforo pra sincornizar leitura com a atuação
         xSemaphoreGive(semaphore_pwm);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Duplica valores brutos e covertidos para ser consumido pela task file e PWM
+        xQueueSend(adc_read_queue, &adc_read, NULL);
+        // libera semaforo pra sincornizar leitura com a gravação
+        xSemaphoreGive(semaphore_file);
+        
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
     //Tear Down
     ESP_ERROR_CHECK(adc_oneshot_del_unit(adc_handle));
@@ -190,30 +234,65 @@ static void PWM_task(void* arg){
     
     // tensão aplicada na armadura
     uint64_t V_a = 20;
+    // tempo em on do sinal PWM
     uint64_t LEDC_DUTY;
     ADC_data adc_read = {};
     // loop da task
     while (1){
         // Espera semaforo ser liberado pela task timer e checa o modo do PWM
-        if (xSemaphoreTake(semaphore_pwm, portMAX_DELAY)){
-            if(xQueueReceive(adc_read_queue, &adc_read, 0)){
-                if((adc_read.voltage[0] < GAMMA*100) && Motor_on){
-                    LEDC_DUTY = (V_a*8191/V_A_MAX);
-                    // seta o duty do PWM
-                    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
-                    // atualiza o valor do duty
-                    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
-                    //ESP_LOGI(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
-                }
-                else {
-                    LEDC_DUTY = 0;
-                    // seta o duty do PWM
-                    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
-                    // atualiza o valor do duty
-                    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
-                }
-            }
+        if (!xSemaphoreTake(semaphore_pwm, portMAX_DELAY)){
+            continue;
         }
+        if(!xQueueReceive(adc_read_queue, &adc_read, 0)){
+            ESP_LOGI(PWM, "valor lido:%d < %d",adc_read.voltage[0], GAMMA*100);
+            continue;
+        }
+        if((adc_read.voltage[0] < GAMMA*100) && Motor_on){
+            LEDC_DUTY = (V_a*8191/V_A_MAX);
+            // seta o duty do PWM
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+            // atualiza o valor do duty
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+            ESP_LOGI(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
+        }
+        else {
+            LEDC_DUTY = 0;
+            // seta o duty do PWM
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
+            // atualiza o valor do duty
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+        }
+    }
+}
+// Definindo task que vai salvar os dados em uma aequivo 
+static void File_task(void *arg){
+    FILE* f = fopen("/data/ADC.txt", "w");
+    ESP_LOGI(TAG, "Criando arquivo para salvar os dados");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Falha ao abrir o arquivo pra escrita");
+        return;
+    }
+    // cria o cabeçario do arquivo
+    fprintf(f, "Interação;Theta_1;dTheta_1;\n");
+    ESP_LOGI(TAG, "Cria o cabeçario do arquivo");
+    fclose(f);
+
+    ADC_data adc_read = {};
+    int i = 1;
+    // loop de gravação do arquivo
+    while(1){
+        if (!xSemaphoreTake(semaphore_file, portMAX_DELAY)){
+            continue;
+        }
+        if(!xQueueReceive(adc_read_queue, &adc_read, 0)){
+            continue;
+        }
+        fopen("/data/ADC.txt", "a");
+        fprintf(f, "%d: %d; ;\n", i, adc_read.voltage[0]);
+        // incluir estampa de tempo
+        fclose(f);
+        ESP_LOGI(File,"escrito no arquivo:%d; ;\n", adc_read.voltage[0]);
+        i++;
     }
 }
 
@@ -236,19 +315,26 @@ static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
 void app_main(void){
     // criação do semaphore binario 
     semaphore_pwm = xSemaphoreCreateBinary();
+    semaphore_file = xSemaphoreCreateBinary();
 
+    //Inicia a nova partição de dados
+    ESP_ERROR_CHECK(nvs_flash_init());
+    //Iniciar partição de arquivos
+    const char* base_path = "/data";
+    ESP_ERROR_CHECK(mount_storage(base_path));
+    
     // Configurando pinos de saida do esp32
     config_gpio(GPIO_OUTPUT_PIN_SEL,GPIO_MODE_OUTPUT,0,0,GPIO_INTR_DISABLE);
     // Configurando pinos de entrada do esp32
     config_gpio(GPIO_INPUT_PIN_SEL,GPIO_MODE_INPUT,1,0,GPIO_INTR_POSEDGE);
 
-     // criado 'Queue' para interrupções
+    /*// criado 'Queue' para interrupções
     gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     // check para criação da 'Queue'
     if (!gpio_evt_queue) {
         ESP_LOGE(TAG, "Falha ao criar Queue");
         return;
-    }
+    }//*/
     // criado 'Queue' para a leitura do ADC
     adc_read_queue = xQueueCreate(10, sizeof(ADC_data));
     // check para criação da 'Queue'
@@ -257,8 +343,10 @@ void app_main(void){
         return;
     }
     
+    // Inicindo as tasks
     xTaskCreate(Leitura_ADC, "Inicia a leitura do angulo theta1", 2048, NULL, 10, NULL);
     xTaskCreate(PWM_task, "Inicia a atuação do motor", 2048, NULL, 10, NULL);
+    xTaskCreate(File_task, "Inicia a gravacao dos dados medidos", 2048, NULL, 10, NULL);
 
     // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);

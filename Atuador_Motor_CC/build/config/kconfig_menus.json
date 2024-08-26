@@ -4824,11 +4824,37 @@
                 ],
                 "title": "GPIO input pin 1",
                 "type": "int"
+            },
+            {
+                "children": [],
+                "depends_on": null,
+                "help": "Tens\u00e3o nominal de armadura do motor cc de excita\u00e7\u00e3o do sistema",
+                "id": "V_A_MAX",
+                "name": "V_A_MAX",
+                "range": [
+                    20,
+                    50
+                ],
+                "title": "Tens\u00e3o nominal de armadura do motor CC",
+                "type": "int"
+            },
+            {
+                "children": [],
+                "depends_on": null,
+                "help": "Posi\u00e7\u00e3o angular do eixo da haste 1 que inicia a excita\u00e7\u00e3o sistema",
+                "id": "GAMMA",
+                "name": "GAMMA",
+                "range": [
+                    15,
+                    60
+                ],
+                "title": "Angulo de arbertura para excita\u00e7\u00e3o do sistema",
+                "type": "int"
             }
         ],
         "depends_on": null,
-        "id": "example-configuration",
-        "title": "Example Configuration",
+        "id": "parameters-configuration",
+        "title": "Parameters Configuration",
         "type": "menu"
     },
     {

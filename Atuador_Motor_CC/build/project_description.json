@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "main",
-    "project_version":    "dd8e328-dirty",
+    "project_version":    "427373f-dirty",
     "project_path":       "D:/Documentos/UFMG/PFC/ESP32/Projetos/PFC/Atuador_Motor_CC",
     "idf_path":           "C:/Espressif/frameworks/esp-idf-v5.2.2",
     "build_dir":          "D:/Documentos/UFMG/PFC/ESP32/Projetos/PFC/Atuador_Motor_CC/build",

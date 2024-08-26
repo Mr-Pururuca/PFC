@@ -15,5 +15,6 @@
     "utility": "c",
     "variant": "c",
     "inttypes.h": "c"
-  }
+  },
+  "C_Cpp.errorSquiggles": "disabled"
 }
