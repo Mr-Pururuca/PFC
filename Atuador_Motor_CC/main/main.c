@@ -1,24 +1,40 @@
 //---------------------------------------Bibliotecas----------------------------------------//
 #include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
-#include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
+
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
-#include "esp_log.h"
 #include "driver/ledc.h"
+
 #include "esp_err.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-#include "esp_spiffs.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "lwip/sockets.h"
+#include "lwip/dns.h"
+#include "lwip/netdb.h"
+
+#include "protocol_examples_common.h"
+#include "mqtt_client.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
 //------------------------------------------Defines-----------------------------------------//
 // difinindo o valor das entradas pela configuração do menu
@@ -48,26 +64,30 @@ typedef struct{
 
 //-------------------------------------------TAGs-------------------------------------------//
 static const char* TAG = "Projeto";
-static const char* PWM = "Atuador do Motor";
-static const char* ADC = "ADC";
-static const char* File = "File";
-
-//-----------------------------------------Drivers------------------------------------------//
-// Fazer drives de comunição
+//static const char* PWM = "Atuador do Motor";
+static const char* ADC = "Letura de dados";
+static const char* MQTT = "MQTT";
+static const char* PUB = "Armazenando dados";
 
 //-----------------------------------------Handles------------------------------------------//
+
 // Inicializando 'Queues' no contexto global
 //static QueueHandle_t gpio_evt_queue = NULL;
+static QueueHandle_t data_pub_queue = NULL;
 static QueueHandle_t adc_read_queue = NULL;
 // Iniciando semaforos no contexto global
-static SemaphoreHandle_t semaphore_pwm = NULL;
-static SemaphoreHandle_t semaphore_file = NULL;
+// static SemaphoreHandle_t semaphore_motor = NULL;
+static SemaphoreHandle_t semaphore_Pub = NULL;
+// Iniciando handle da conexão MQTT
+esp_mqtt_client_handle_t client;
 
 //------------------------------------Variaveis Globais-------------------------------------//
+
 // Variavel que liga a função de atuação do motor
 static bool Motor_on = false;
 
 //--------------------------------------Funções Gerais--------------------------------------//
+
 // definição da função de configurar GPIO
 static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, gpio_pulldown_t pull_down, gpio_int_type_t itr_type){
     // inicializando a estrutura de configuração
@@ -124,41 +144,78 @@ static void adc_calibration_deinit(adc_cali_handle_t handle){
     ESP_LOGI(TAG, "Deletando schema de calibração Line Fitting");
     ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle)); 
 }
-// definição função para inicializar SPIFFS
-esp_err_t mount_storage(const char* base_path){
-    ESP_LOGI(TAG, "Initializing SPIFFS");
+// MQTT log error
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(MQTT, "Last error %s: 0x%x", message, error_code);
+    }
+}
 
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = base_path,
-        .partition_label = NULL,
-        .max_files = 5,   // This sets the maximum number of files that can be open at the same time
-        .format_if_mount_failed = true
-    };
+//-----------------------------------------Callbacks----------------------------------------//
 
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount or format filesystem");
-        } else if (ret == ESP_ERR_NOT_FOUND) {
-            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+// MQTT event handler
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(MQTT, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    client = event->client;
+    int msg_id;
+    // uint16_t duty_mqtt = 0;
+    char *texto_mqtt;                // Cria o espaço para receber o texto
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(MQTT, "MQTT_EVENT_CONNECTED");
+
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/comandos", 1);    
+        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/Theta_1", 1);     
+        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/Vel_angular_1", 1);     
+        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
+        msg_id = esp_mqtt_client_subscribe(client, "/topic/Tensao_armadura", 1);      
+        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
+
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(MQTT, "MQTT_EVENT_DISCONNECTED");
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(MQTT, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        msg_id = esp_mqtt_client_publish(client, "/topic/reset", "data", 0, 0, 0);
+        ESP_LOGI(MQTT, "sent publish successful, msg_id=%d", msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(MQTT, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(MQTT, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(MQTT, "MQTT_EVENT_DATA");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        asprintf(&texto_mqtt, "%.*s", event->data_len, event->data);
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(MQTT, "MQTT_EVENT_ERROR");
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            ESP_LOGI(MQTT, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
         }
-        return ret;
+        break;
+    default:
+        ESP_LOGI(MQTT, "Other event id:%d", event->event_id);
+        break;
     }
-
-    size_t total = 0, used = 0;
-    ret = esp_spiffs_info(NULL, &total, &used);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
-    return ESP_OK;
+    // free(texto_mqtt);
 }
 
 //------------------------------------------Tasks-------------------------------------------//
+
 // Definição da task para leitura do do ADC
 static void Leitura_ADC(void *arg){
     ESP_LOGI(TAG, "Task ADC iniciou");
@@ -188,16 +245,14 @@ static void Leitura_ADC(void *arg){
         if (do_calibration) {
             // faz a conversão do valor bruto para a variavel
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle,  adc_read.adc_raw[0], &adc_read.voltage[0]));
-            ESP_LOGI(ADC, "Valor lido de posição: %d",adc_read.voltage[0] );
+            ESP_LOGI(ADC, "Valor lido de posição: %d",adc_read.voltage[0]);
         }
         // insere os valores brutos e convertidos na 'queue'
         xQueueSend(adc_read_queue, &adc_read, NULL);
-        // libera semaforo pra sincornizar leitura com a atuação
-        xSemaphoreGive(semaphore_pwm);
-        // Duplica valores brutos e covertidos para ser consumido pela task file e PWM
-        xQueueSend(adc_read_queue, &adc_read, NULL);
-        // libera semaforo pra sincornizar leitura com a gravação
-        xSemaphoreGive(semaphore_file);
+        // insere os valores brutos e convertidos na 'queue' de publicação
+        xQueueSend(data_pub_queue, &adc_read, NULL);
+        // libera semaforo pra sincornizar a de publicação de dados
+        xSemaphoreGive(semaphore_Pub);
         
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -207,7 +262,7 @@ static void Leitura_ADC(void *arg){
         adc_calibration_deinit(adc_cali_handle);
     }
 }
-// Definindo task para acionamento do motor via PWM
+/*// Definindo task para acionamento do motor via PWM
 static void PWM_task(void* arg){
     ESP_LOGI(TAG, "Task PWM iniciou");
    // Configuração do timer do LEDC PWM
@@ -264,39 +319,59 @@ static void PWM_task(void* arg){
         }
     }
 }
-// Definindo task que vai salvar os dados em uma aequivo 
-static void File_task(void *arg){
-    FILE* f = fopen("/data/ADC.txt", "w");
-    ESP_LOGI(TAG, "Criando arquivo para salvar os dados");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Falha ao abrir o arquivo pra escrita");
-        return;
-    }
-    // cria o cabeçario do arquivo
-    fprintf(f, "Interação;Theta_1;dTheta_1;\n");
-    ESP_LOGI(TAG, "Cria o cabeçario do arquivo");
-    fclose(f);
+*/
+// Definindo da função de conexão com o Broaker MQTT
+static void MQTT_Connect(){
+    ESP_LOGI(TAG, "Task MQTT iniciou");
+    ESP_LOGI(MQTT, "[APP] Startup..");
+    ESP_LOGI(MQTT, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
+    ESP_LOGI(MQTT, "[APP] IDF version: %s", esp_get_idf_version());
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set("mqtt_client", ESP_LOG_VERBOSE);
+    esp_log_level_set("MQTT_EXAMPLE", ESP_LOG_VERBOSE);
+    esp_log_level_set("TRANSPORT_BASE", ESP_LOG_VERBOSE);
+    esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
+    esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
+    esp_log_level_set("outbox", ESP_LOG_VERBOSE);
 
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* This helper functon configures Wi-Fi or Ethernet, as selected in menuconfig.
+     * Read "Establishing Wi-Fi or Ethernet Connection" section in
+     * examples/protocols/README.md for more information about this function.
+     */
+    ESP_ERROR_CHECK(example_connect());
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = CONFIG_BROKER_URL,
+        .credentials.username = "ESP_32",
+        .credentials.authentication.password = "PFC123",
+    };
+
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
+}
+// Definição da task de publicação de dados assincrona
+static void Data_pub(){
+    ESP_LOGI(TAG, "Task Data_pub iniciou");
+    char *texto_mqtt;
     ADC_data adc_read = {};
-    int i = 1;
-    // loop de gravação do arquivo
-    while(1){
-        if (!xSemaphoreTake(semaphore_file, portMAX_DELAY)){
-            continue;
-        }
-        if(!xQueueReceive(adc_read_queue, &adc_read, 0)){
-            continue;
-        }
-        fopen("/data/ADC.txt", "a");
-        fprintf(f, "%d: %d; ;\n", i, adc_read.voltage[0]);
-        // incluir estampa de tempo
-        fclose(f);
-        ESP_LOGI(File,"escrito no arquivo:%d; ;\n", adc_read.voltage[0]);
-        i++;
+    while (1){
+        
+        if(xQueueReceive(data_pub_queue, &adc_read, 0)){
+            ESP_LOGI(PUB, "Theta_1:%d",adc_read.voltage[0]);
+            asprintf(&texto_mqtt, "%.2d", adc_read.voltage[0]);
+            esp_mqtt_client_publish(client, "/topic/Theta_1", texto_mqtt, 0, 1, 1);    
     }
+   }
 }
 
 //---------------------------------------Interrupções---------------------------------------//
+
 // Definindo da função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
     if(!Motor_on){
@@ -312,16 +387,10 @@ static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
 }
 
 //--------------------------------------Função primaria-------------------------------------//
+
 void app_main(void){
     // criação do semaphore binario 
-    semaphore_pwm = xSemaphoreCreateBinary();
-    semaphore_file = xSemaphoreCreateBinary();
-
-    //Inicia a nova partição de dados
-    ESP_ERROR_CHECK(nvs_flash_init());
-    //Iniciar partição de arquivos
-    const char* base_path = "/data";
-    ESP_ERROR_CHECK(mount_storage(base_path));
+    semaphore_Pub = xSemaphoreCreateBinary();
     
     // Configurando pinos de saida do esp32
     config_gpio(GPIO_OUTPUT_PIN_SEL,GPIO_MODE_OUTPUT,0,0,GPIO_INTR_DISABLE);
@@ -342,11 +411,21 @@ void app_main(void){
         ESP_LOGE(TAG, "Falha ao criar Queue");
         return;
     }
+    // criado 'Queue' para publicação no broker MQTT
+    data_pub_queue = xQueueCreate(10, sizeof(ADC_data));
+    // check para criação da 'Queue'
+    if (!data_pub_queue) {
+        ESP_LOGE(TAG, "Falha ao criar Queue");
+        return;
+    }
+
+    // inicia conexão com Broker MQQTT
+    MQTT_Connect();
     
     // Inicindo as tasks
     xTaskCreate(Leitura_ADC, "Inicia a leitura do angulo theta1", 2048, NULL, 10, NULL);
-    xTaskCreate(PWM_task, "Inicia a atuação do motor", 2048, NULL, 10, NULL);
-    xTaskCreate(File_task, "Inicia a gravacao dos dados medidos", 2048, NULL, 10, NULL);
+    //xTaskCreate(PWM_task, "Inicia a atuação do motor", 2048, NULL, 10, NULL);
+    xTaskCreate(Data_pub,"Inicia gravação dos dados no broker MQTT", 2048, NULL, 10, NULL);
 
     // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
