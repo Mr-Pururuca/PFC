@@ -36,24 +36,45 @@ menu "Parameters Configuration"
         default 22
         help
             GPIO pin number to be used as GPIO_INPUT_IO_1.
+    
+    config GPIO_INPUT_2
+        int "GPIO input pin 2"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 16
+        help
+            GPIO pin number to be used as GPIO_INPUT_IO_2.
+
+    config GPIO_INPUT_3
+        int "GPIO input pin 3"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 17
+        help
+            GPIO pin number to be used as GPIO_INPUT_IO_3.
 
     config V_A_MAX
         int "Tensão nominal de armadura do motor CC"
-        range 20 50
-        default 25
+        range 6 30
+        default 24
         help
             Tensão nominal de armadura do motor cc de excitação do sistema
     
     config GAMMA
         int "Angulo de arbertura para excitação do sistema"
-        range "15" "60"
+        range 15 60
         default 30
         help
             Posição angular do eixo da haste 1 que inicia a excitação sistema
+    
+    config SYS_TEMPO_AMOST
+        int "Tempo de amostragem do sistema em milisegundos"
+        range 10 500
+        default 500
+        help
+            Tempo de amostragem do sistema em milisegundos
             
     config BROKER_URL
         string "Broker URL"
-        default "mqtt://192.168.18.1:1883"
+        default "mqtt://192.168.18.175:1883"
         help
             URL de acesso do Broker MQTT no formato mqtt://IP:Porta
 endmenu

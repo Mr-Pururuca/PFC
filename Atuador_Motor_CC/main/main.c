@@ -5,12 +5,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <math.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "driver/ledc.h"
+#include "driver/pulse_cnt.h"
 
 #include "esp_err.h"
 #include "esp_event.h"
@@ -37,9 +39,12 @@
 #include "sdkconfig.h"
 
 //------------------------------------------Defines-----------------------------------------//
-// difinindo o valor das entradas pela configuração do menu
+
+// definindo o valor das entradas pela configuração do menu
 #define GPIO_INPUT_IO_0     CONFIG_GPIO_INPUT_0
 #define GPIO_INPUT_IO_1     CONFIG_GPIO_INPUT_1
+#define GPIO_INPUT_IO_A     CONFIG_GPIO_INPUT_2
+#define GPIO_INPUT_IO_B     CONFIG_GPIO_INPUT_3
 // agrupar o mapeamento binario das portas de entrada
 #define GPIO_INPUT_PIN_SEL  ((1ULL<<GPIO_INPUT_IO_0) | (1ULL<<GPIO_INPUT_IO_1))
 // difinindo o valor das saidas pela configuração do menu
@@ -54,18 +59,36 @@
 #define V_A_MAX   CONFIG_V_A_MAX
 // definindo o algulo de atuação do motor
 #define GAMMA   CONFIG_GAMMA
+// definindo os limites do PCNT
+#define PCNT_HIGH_LIMIT 30000
+#define PCNT_LOW_LIMIT  -30000
+// define o tempo de amostragem do sistema
+#define SYS_TEMPO_AMOST CONFIG_SYS_TEMPO_AMOST
+// define constantes para calculos do encoder
+// PI
+#define PI 3.141593
+// ganho de conversão do pulso em angulo (rad) 4*600/2*PI (encoder de 600 pulsos)
+#define Kecod 0.002618
 
 //-----------------------------------Estruturas de dados------------------------------------//
+
 // Definindo estrutura de leitura do ADC
-typedef struct{
+/*typedef struct{
     int adc_raw[10];
     int voltage[10];
-}ADC_data;
+}ADC_data;*/
+// Definindo estrutura de leitura do encoder
+typedef struct{
+    float Pos;
+    float Vel;
+}Encoder_data;
 
 //-------------------------------------------TAGs-------------------------------------------//
+
 static const char* TAG = "Projeto";
-//static const char* PWM = "Atuador do Motor";
-static const char* ADC = "Letura de dados";
+static const char* PWM = "Atuador do Motor";
+//static const char* ADC = "Letura de dados";
+static const char* PCNT = "Encoder";
 static const char* MQTT = "MQTT";
 static const char* PUB = "Armazenando dados";
 
@@ -74,9 +97,10 @@ static const char* PUB = "Armazenando dados";
 // Inicializando 'Queues' no contexto global
 //static QueueHandle_t gpio_evt_queue = NULL;
 static QueueHandle_t data_pub_queue = NULL;
-static QueueHandle_t adc_read_queue = NULL;
+//static QueueHandle_t adc_read_queue = NULL;
+static QueueHandle_t encoder_read_queue = NULL;
 // Iniciando semaforos no contexto global
-// static SemaphoreHandle_t semaphore_motor = NULL;
+static SemaphoreHandle_t semaphore_pwm = NULL;
 static SemaphoreHandle_t semaphore_Pub = NULL;
 // Iniciando handle da conexão MQTT
 esp_mqtt_client_handle_t client;
@@ -107,7 +131,7 @@ static void config_gpio(uint64_t mask, gpio_mode_t mode, gpio_pullup_t pull_up, 
     // configura as gpio com os valores setados
     gpio_config(&io_conf);
 }
-// definição da função de calibração do ADC
+/*// definição da função de calibração do ADC
 static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle){
     // Iniciando um calibrador ADC
     adc_cali_handle_t handle = NULL;
@@ -144,6 +168,7 @@ static void adc_calibration_deinit(adc_cali_handle_t handle){
     ESP_LOGI(TAG, "Deletando schema de calibração Line Fitting");
     ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle)); 
 }
+*/
 // MQTT log error
 static void log_error_if_nonzero(const char *message, int error_code)
 {
@@ -167,24 +192,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(MQTT, "MQTT_EVENT_CONNECTED");
-
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/comandos", 1);    
+        msg_id = esp_mqtt_client_subscribe(client, "PFC/Medidas/Cmd", 1);
         ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/Theta_1", 1);     
-        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/Vel_angular_1", 1);     
-        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/Tensao_armadura", 1);      
-        ESP_LOGI(MQTT, "sent subscribe successful, msg_id=%d", msg_id);
-
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(MQTT, "MQTT_EVENT_DISCONNECTED");
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(MQTT, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        msg_id = esp_mqtt_client_publish(client, "/topic/reset", "data", 0, 0, 0);
-        ESP_LOGI(MQTT, "sent publish successful, msg_id=%d", msg_id);
+        esp_mqtt_client_publish(client, "PFC/Medidas/Cmd", "off", 0, 1, 1);
         break;
     case MQTT_EVENT_UNSUBSCRIBED:
         ESP_LOGI(MQTT, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
@@ -194,9 +210,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_DATA:
         ESP_LOGI(MQTT, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
         asprintf(&texto_mqtt, "%.*s", event->data_len, event->data);
+        if (!strcmp(texto_mqtt, "on")){
+            ESP_LOGI(TAG,"Excitação do sistema ligada");
+            Motor_on = true;
+            gpio_set_level(GPIO_OUTPUT_IO_2, 1);
+        }else if(!strcmp(texto_mqtt, "off")){
+            ESP_LOGI(TAG,"Excitação do sistema desligada");
+            Motor_on = false;
+            gpio_set_level(GPIO_OUTPUT_IO_2, 0);
+        }
+        free(texto_mqtt);
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(MQTT, "MQTT_EVENT_ERROR");
@@ -211,12 +235,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(MQTT, "Other event id:%d", event->event_id);
         break;
     }
-    // free(texto_mqtt);
 }
 
 //------------------------------------------Tasks-------------------------------------------//
 
-// Definição da task para leitura do do ADC
+/*// Definição da task para leitura do do ADC
 static void Leitura_ADC(void *arg){
     ESP_LOGI(TAG, "Task ADC iniciou");
     // iniciando um modulo ADC do modo oneshot
@@ -262,10 +285,86 @@ static void Leitura_ADC(void *arg){
         adc_calibration_deinit(adc_cali_handle);
     }
 }
-/*// Definindo task para acionamento do motor via PWM
+*/
+// Definindo task de leitura do enconder
+static void Encoder_read(){
+    ESP_LOGI(TAG, "Task Encoder iniciou");
+    ESP_LOGI(PCNT, "Configuração da unidade PCNT");
+    pcnt_unit_config_t unit_config = {
+        .high_limit = PCNT_HIGH_LIMIT,
+        .low_limit = PCNT_LOW_LIMIT,
+        .flags.accum_count = 0,
+    };
+    pcnt_unit_handle_t pcnt_unit = NULL;
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_unit));
+
+    ESP_LOGI(PCNT, "configuração do filtro de glitch");
+    pcnt_glitch_filter_config_t filter_config = {
+        .max_glitch_ns = 1000,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filter_config));
+
+    ESP_LOGI(PCNT, "Configuração dos canais do pcnt");
+    pcnt_chan_config_t chan_a_config = {
+        .edge_gpio_num = GPIO_INPUT_IO_A,
+        .level_gpio_num = GPIO_INPUT_IO_B,
+    };
+    pcnt_channel_handle_t pcnt_chan_a = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_a_config, &pcnt_chan_a));
+    pcnt_chan_config_t chan_b_config = {
+        .edge_gpio_num = GPIO_INPUT_IO_B,
+        .level_gpio_num = GPIO_INPUT_IO_A,
+    };
+    pcnt_channel_handle_t pcnt_chan_b = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_b_config, &pcnt_chan_b));
+
+    ESP_LOGI(TAG, "configuração das ações dos canais nas bordas e nos niveis");
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+    ESP_LOGI(PCNT, "Habilita unidade pcnt");
+    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+    ESP_LOGI(PCNT, "Limpa contagem do pcnt");
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    ESP_LOGI(PCNT, "iniciar contagem do pcnt");
+    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
+    
+    // Leitura dos pulsos
+    int pulse_count = 0;
+    int count = 0;
+    // Leitura da posição e velocidade
+    Encoder_data encod_r = {};
+
+    // loop da task
+    while (1) {
+        ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulse_count));
+        //ESP_LOGI(PCNT, "Pulse count: %d", pulse_count);
+        // calculo da posição
+        encod_r.Pos = pulse_count*Kecod;
+        //ESP_LOGI(PCNT, "Theta 1: %.4f rad", encod_r.Pos);
+        // calculo da velocidade
+        encod_r.Vel = (pulse_count - count)*Kecod/(SYS_TEMPO_AMOST/1000.0);
+        count = pulse_count;
+        //ESP_LOGI(PCNT, "Omega 1: %.4f rad/s", encod_r.Vel);
+
+        // insere os valores de posição e velocidade na 'queue'
+        xQueueSend(encoder_read_queue, &encod_r, NULL);
+        // insere os valores posição posição e velocidade na 'queue' de publicação
+        xQueueSend(data_pub_queue, &encod_r, NULL);
+        // libera semaforo pra sincornizar a atuação do motor
+        xSemaphoreGive(semaphore_pwm);
+        
+        //Delay da tast com tempo de amostragem 
+        vTaskDelay(pdMS_TO_TICKS(SYS_TEMPO_AMOST));
+    }
+}
+// Definindo task para acionamento do motor via PWM
 static void PWM_task(void* arg){
     ESP_LOGI(TAG, "Task PWM iniciou");
-   // Configuração do timer do LEDC PWM
+
+   // ESP_LOGI(PWM,"Configuração do timer do LEDC PWM");
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
         .timer_num        = LEDC_TIMER_0,
@@ -275,7 +374,7 @@ static void PWM_task(void* arg){
     };
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
 
-    // Configuração do channel do LEDC PWM
+    // ESP_LOGI(PWM,"Configuração do channel do LEDC PWM");
     ledc_channel_config_t ledc_channel = {
         .speed_mode     = LEDC_LOW_SPEED_MODE,
         .channel        = LEDC_CHANNEL_0,
@@ -288,27 +387,34 @@ static void PWM_task(void* arg){
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     
     // tensão aplicada na armadura
-    uint64_t V_a = 20;
+    uint64_t V_a = 3;
     // tempo em on do sinal PWM
     uint64_t LEDC_DUTY;
-    ADC_data adc_read = {};
+    // Leitura da posição e velocidade
+    Encoder_data encod_r = {};
+
     // loop da task
     while (1){
-        // Espera semaforo ser liberado pela task timer e checa o modo do PWM
+        // Espera semaforo ser liberado pela interupsão de leitura do encoder
         if (!xSemaphoreTake(semaphore_pwm, portMAX_DELAY)){
             continue;
         }
-        if(!xQueueReceive(adc_read_queue, &adc_read, 0)){
-            ESP_LOGI(PWM, "valor lido:%d < %d",adc_read.voltage[0], GAMMA*100);
+        if(!xQueueReceive(encoder_read_queue, &encod_r, 0)){
             continue;
         }
-        if((adc_read.voltage[0] < GAMMA*100) && Motor_on){
+        float Theta1 = fmod(encod_r.Pos,(2*PI));
+            if (Theta1 > PI){
+                Theta1 = Theta1 - (2*PI);
+            }
+        //ESP_LOGI(PWM, "|Theta1|: %.4f < %f", fabs(Theta1), GAMMA*PI/180);
+        if((fabs(Theta1) < (GAMMA*PI/180)) && Motor_on){
+            // converte o valor da tensão para o sinal do PWM
             LEDC_DUTY = (V_a*8191/V_A_MAX);
             // seta o duty do PWM
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_DUTY));
             // atualiza o valor do duty
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
-            ESP_LOGI(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
+            //ESP_LOGI(PWM, "Tensão aplicada no motor: %"PRIu64"V",LEDC_DUTY );
         }
         else {
             LEDC_DUTY = 0;
@@ -319,7 +425,6 @@ static void PWM_task(void* arg){
         }
     }
 }
-*/
 // Definindo da função de conexão com o Broaker MQTT
 static void MQTT_Connect(){
     ESP_LOGI(TAG, "Task MQTT iniciou");
@@ -359,15 +464,17 @@ static void MQTT_Connect(){
 static void Data_pub(){
     ESP_LOGI(TAG, "Task Data_pub iniciou");
     char *texto_mqtt;
-    ADC_data adc_read = {};
+    Encoder_data encod_r = {};
     while (1){
-        
-        if(xQueueReceive(data_pub_queue, &adc_read, 0)){
-            ESP_LOGI(PUB, "Theta_1:%d",adc_read.voltage[0]);
-            asprintf(&texto_mqtt, "%.2d", adc_read.voltage[0]);
-            esp_mqtt_client_publish(client, "/topic/Theta_1", texto_mqtt, 0, 1, 1);    
+        if(xQueueReceive(data_pub_queue, &encod_r, 0)){
+            ESP_LOGI(PUB, "Theta_1:%.4f",encod_r.Pos);
+            asprintf(&texto_mqtt, "%.4f", encod_r.Pos);
+            esp_mqtt_client_publish(client, "PFC/Medidas/Theta_1", texto_mqtt, 0, 1, 1);
+            ESP_LOGI(PUB, "Omega_1:%.4f",encod_r.Vel);
+            asprintf(&texto_mqtt, "%.4f", encod_r.Pos);
+            esp_mqtt_client_publish(client, "PFC/Medidas/Omega_1", texto_mqtt, 0, 1, 1);
+        }
     }
-   }
 }
 
 //---------------------------------------Interrupções---------------------------------------//
@@ -375,12 +482,11 @@ static void Data_pub(){
 // Definindo da função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
     if(!Motor_on){
-        //ESP_LOGI(TAG,"Excitação do sistema ligada");
+        //"Excitação do sistema ligada"
         Motor_on = true;
         gpio_set_level(GPIO_OUTPUT_IO_2, 1);
-    }
-    else{
-        //ESP_LOGI(TAG,"Excitação do sistema desligada");
+    }else{
+        //"Excitação do sistema desligada"
         Motor_on = false;
         gpio_set_level(GPIO_OUTPUT_IO_2, 0);
     }
@@ -389,8 +495,10 @@ static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
 //--------------------------------------Função primaria-------------------------------------//
 
 void app_main(void){
+
     // criação do semaphore binario 
     semaphore_Pub = xSemaphoreCreateBinary();
+    semaphore_pwm = xSemaphoreCreateBinary();
     
     // Configurando pinos de saida do esp32
     config_gpio(GPIO_OUTPUT_PIN_SEL,GPIO_MODE_OUTPUT,0,0,GPIO_INTR_DISABLE);
@@ -402,17 +510,17 @@ void app_main(void){
     // check para criação da 'Queue'
     if (!gpio_evt_queue) {
         ESP_LOGE(TAG, "Falha ao criar Queue");
-        return;
+        return;ssssssssssssssssssssssssssssssssssssssc            555555555555555555555
     }//*/
-    // criado 'Queue' para a leitura do ADC
-    adc_read_queue = xQueueCreate(10, sizeof(ADC_data));
+    // criado 'Queue' para a leitura do encoder
+    encoder_read_queue = xQueueCreate(10, sizeof(Encoder_data));
     // check para criação da 'Queue'
-    if (!adc_read_queue) {
+    if (!encoder_read_queue) {
         ESP_LOGE(TAG, "Falha ao criar Queue");
         return;
     }
     // criado 'Queue' para publicação no broker MQTT
-    data_pub_queue = xQueueCreate(10, sizeof(ADC_data));
+    data_pub_queue = xQueueCreate(10, sizeof(Encoder_data));
     // check para criação da 'Queue'
     if (!data_pub_queue) {
         ESP_LOGE(TAG, "Falha ao criar Queue");
@@ -423,9 +531,9 @@ void app_main(void){
     MQTT_Connect();
     
     // Inicindo as tasks
-    xTaskCreate(Leitura_ADC, "Inicia a leitura do angulo theta1", 2048, NULL, 10, NULL);
-    //xTaskCreate(PWM_task, "Inicia a atuação do motor", 2048, NULL, 10, NULL);
-    xTaskCreate(Data_pub,"Inicia gravação dos dados no broker MQTT", 2048, NULL, 10, NULL);
+    xTaskCreate(Encoder_read, "Leitura do encoder", 4096, NULL, 10, NULL);
+    xTaskCreate(PWM_task, "Atuação do motor", 2048, NULL, 10, NULL);
+    xTaskCreate(Data_pub,"Gravação dos dados", 2048, NULL, 10, NULL);
 
     // Definindo o serviço de isr
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
