@@ -95,7 +95,7 @@ static const char* PUB = "Armazenando dados";
 //-----------------------------------------Handles------------------------------------------//
 
 // Inicializando 'Queues' no contexto global
-//static QueueHandle_t gpio_evt_queue = NULL;
+static QueueHandle_t gpio_evt_queue = NULL;
 static QueueHandle_t data_pub_queue = NULL;
 //static QueueHandle_t adc_read_queue = NULL;
 static QueueHandle_t encoder_read_queue = NULL;
@@ -200,7 +200,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(MQTT, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        esp_mqtt_client_publish(client, "PFC/Medidas/Cmd", "off", 0, 1, 1);
+        esp_mqtt_client_publish(client, "PFC/Comandos/Motor", "off", 0, 1, 1);
         break;
     case MQTT_EVENT_UNSUBSCRIBED:
         ESP_LOGI(MQTT, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
@@ -387,7 +387,7 @@ static void PWM_task(void* arg){
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     
     // tensão aplicada na armadura
-    uint64_t V_a = 3;
+    int V_a = 3;
     // tempo em on do sinal PWM
     uint64_t LEDC_DUTY;
     // Leitura da posição e velocidade
@@ -474,6 +474,9 @@ static void Data_pub(){
             asprintf(&texto_mqtt, "%.4f", encod_r.Pos);
             esp_mqtt_client_publish(client, "PFC/Medidas/Omega_1", texto_mqtt, 0, 1, 1);
         }
+        if(xQueueReceive(gpio_evt_queue, &texto_mqtt, 0)){
+            esp_mqtt_client_publish(client, "PFC/Medidas/Cmd", texto_mqtt, 0, 1, 1);
+        }
     }
 }
 
@@ -481,14 +484,19 @@ static void Data_pub(){
 
 // Definindo da função de leitura de interrupção
 static void IRAM_ATTR gpio_isr_Motor_on(void* arg){
+    char *texto_mqtt;
     if(!Motor_on){
         //"Excitação do sistema ligada"
         Motor_on = true;
         gpio_set_level(GPIO_OUTPUT_IO_2, 1);
+        asprintf(&texto_mqtt, "on");
+        xQueueSendFromISR(gpio_evt_queue, &texto_mqtt, NULL);
     }else{
         //"Excitação do sistema desligada"
         Motor_on = false;
         gpio_set_level(GPIO_OUTPUT_IO_2, 0);
+        asprintf(&texto_mqtt, "off");
+        xQueueSendFromISR(gpio_evt_queue, &texto_mqtt, NULL);
     }
 }
 
@@ -505,13 +513,13 @@ void app_main(void){
     // Configurando pinos de entrada do esp32
     config_gpio(GPIO_INPUT_PIN_SEL,GPIO_MODE_INPUT,1,0,GPIO_INTR_POSEDGE);
 
-    /*// criado 'Queue' para interrupções
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    // criado 'Queue' para interrupções
+    gpio_evt_queue = xQueueCreate(10, sizeof(char));
     // check para criação da 'Queue'
     if (!gpio_evt_queue) {
         ESP_LOGE(TAG, "Falha ao criar Queue");
-        return;ssssssssssssssssssssssssssssssssssssssc            555555555555555555555
-    }//*/
+        return;
+    }
     // criado 'Queue' para a leitura do encoder
     encoder_read_queue = xQueueCreate(10, sizeof(Encoder_data));
     // check para criação da 'Queue'
@@ -531,7 +539,7 @@ void app_main(void){
     MQTT_Connect();
     
     // Inicindo as tasks
-    xTaskCreate(Encoder_read, "Leitura do encoder", 4096, NULL, 10, NULL);
+    xTaskCreate(Encoder_read, "Leitura do encoder", 2048, NULL, 10, NULL);
     xTaskCreate(PWM_task, "Atuação do motor", 2048, NULL, 10, NULL);
     xTaskCreate(Data_pub,"Gravação dos dados", 2048, NULL, 10, NULL);
 
